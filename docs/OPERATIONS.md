@@ -45,11 +45,25 @@ curl -X POST -H 'Content-Type: application/json' -d '{"confirm":true}' \
 
 | 场景 | 行为 |
 |---|---|
-| API 在上传中崩溃 | 重启后该件标 `failed`（不晚发布）；blob 残片可按 failed 行清理 |
+| API 在上传中崩溃 | 重启后该件标 `failed`（不晚发布），其密文残片在启动时清理 |
+| 上传悬挂/超时（`UPLOAD_STALE_SECONDS`） | 轮换清退该行、删除残片；之后即使传完也只报失败，绝不发布 |
+| 上传跨越轮换 | 迁移把该 `receiving` 行改绑当前 MK（不改 DEK），完成后条件发布 |
 | API 在轮换中崩溃 | 重启后后台线程自动接续未完成作业到终态 |
 | 崩溃于"MK 已切换、作业未建"窗口 | 启动对账自动补建迁移作业 |
 | 密钥服务重启 | 主密钥从卷内 SQLite 恢复，已入湖原片逐字节可读 |
 | 销毁回执丢失 | KeyClient 重试并以 `/internal/master/status` 只读核实 |
+
+### 上传与轮换的交接规则（排障要点）
+
+- `ready` 是**可解包承诺**：只有信封绑定到"未被任何轮换登记为旧密钥"的
+  主密钥时才会发布；发布为条件 UPDATE，被拒则上传报 `409` 并清理残片。
+- 轮换迁移会主动把 `receiving` 行改绑当前 MK，因此慢上传不会长期阻塞
+  旧密钥销毁，连续轮换可以照常推进。
+- 仍在本进程服务中的上传不会仅因"慢"被清退；只有超过
+  `UPLOAD_STALE_SECONDS` 且本进程无对应活跃请求的 `receiving` 才判失败。
+- 若客户端收到 `409 upload_no_longer_active` / `old_key_destroyed`，说明该次
+  上传已被轮换清退或在其密钥销毁后才完成——重新发起上传即可（幂等令牌已
+  释放）。
 
 ## 6. 已知限制（单实例/SQLite 范围之外）
 
@@ -61,4 +75,5 @@ curl -X POST -H 'Content-Type: application/json' -d '{"confirm":true}' \
 4. GCM 帧验签失败发生在流式响应开始之后，表现为连接中断（HTTP 流无法
    再改状态码）；客户端应将不完整响应当作失败，可重新 GET 重试。
 5. 销毁 MK 是不可逆操作；销毁前系统保证无 ready/receiving 行依赖它，
-   但 failed 历史行的信封将永久无法解包（这些原片本就不可读）。
+   但 failed 历史行的信封将永久无法解包（这些原片本就不可读）。failed 行的
+   密文残片在判失败时及 API 启动时清理，不再占用卷空间。

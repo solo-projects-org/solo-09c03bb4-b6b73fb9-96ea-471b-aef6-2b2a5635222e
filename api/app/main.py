@@ -32,14 +32,26 @@ from starlette.formparsers import MultiPartParser
 MultiPartParser.spool_max_size = MAX_UPLOAD_BYTES
 
 from .crypto_stream import IntegrityError, decrypt_stream, encrypt_stream
+from .inflight import InflightUploads
 from .keyclient import KeyClient, KeyServiceError
-from .metadata import MetadataDB
+from .metadata import (ImageAlreadyExists, IdempotentReplay, MetadataDB,
+                       RetiringKey)
 from .rotation import RotationWorker
 
 db = MetadataDB(DB_PATH)
 keys = KeyClient(KEY_SERVICE_URL, KEY_SERVICE_TOKEN)
+inflight = InflightUploads()
 worker: RotationWorker | None = None
 main_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _remove_blob(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -57,10 +69,21 @@ async def lifespan(app: FastAPI):
             break
         except KeyServiceError:
             await asyncio.sleep(1.0)
-    # 崩溃恢复：上次 receiving 的上传一律失败，禁止"晚发布"依赖旧密钥
-    stale = db.mark_stale_receiving_failed()
-    if stale:
-        print(f"[startup] {stale} interrupted upload(s) marked failed")
+    # 崩溃恢复：上次 receiving 的上传一律失败，禁止"晚发布"依赖旧密钥；
+    # 同时清理这些失败尝试留下的密文残片（单实例下它们不可能再被续传）。
+    stale_blobs = db.mark_stale_receiving_failed()
+    for path in stale_blobs:
+        _remove_blob(path)
+    if stale_blobs:
+        print(f"[startup] {len(stale_blobs)} interrupted upload(s) marked "
+              f"failed and purged")
+    # 历史 failed 行（含轮换清退/发布被拒）的残片同样清理；仅删登记在
+    # BLOB_DIR 内的那份路径，不影响同编号后续成功尝试（其 blob_path 已不同）。
+    blob_root = os.path.realpath(BLOB_DIR) + os.sep
+    for path in db.list_failed_blob_paths():
+        real = os.path.realpath(path) if path else ""
+        if real.startswith(blob_root):
+            _remove_blob(real)
     # 崩溃对账：上次可能已在密钥服务切换了 MK、却没来得及建本地作业
     try:
         key_status = await keys.master_status()
@@ -76,7 +99,7 @@ async def lifespan(app: FastAPI):
                       f"for {key['key_id']}")
     except KeyServiceError as exc:
         print(f"[startup] rotation reconciliation skipped: {exc}")
-    worker = RotationWorker(db, keys, main_loop)
+    worker = RotationWorker(db, keys, main_loop, inflight)
     worker.start()
     yield
     worker.stop()
@@ -117,39 +140,173 @@ async def _stream_to_blob(request: Request, blob_path: str,
     return stats
 
 
-async def _finalize_with_rebind(image_id: str, stats: dict[str, Any]) -> dict[str, Any]:
-    """最终化原片；若其 MK 在上传期间已被轮换切换，则先 rewrap 改绑当前 MK。
+async def _finalize_with_rebind(image_id: str, blob_path: str,
+                                stats: dict[str, Any]) -> dict[str, Any]:
+    """最终化原片：先确保其信封绑定到一把不会在轮换中被销毁的主密钥，
+    再以"本次尝试仍待接收"为条件发布。
 
-    是否需要改绑只依据本地轮换记录判断（不额外依赖密钥服务在线）：
-    该行绑定的正是最近一次轮换的旧 MK 时，说明它是跨越轮换的在途上传。
-    防止在途上传晚发布依赖旧（甚至已销毁）主密钥的原片。
+    改绑依据本地轮换记录 + 密钥服务当前主密钥：
+      * 本行 MASTER_KEY 已被某次轮换登记为旧密钥 -> rewrap 到当前 MK；
+        若该旧 MK 已销毁（极端窗口），rewrap 返回 410，判失败；
+      * 连续轮换/迁移恰好发生：发布 SQL 自身再校验"不是任何轮换旧密钥"，
+        被拒则回到循环重试改绑，绝不发布不可读原片。
+    失败上传（已被轮换清退/进程重启判失败/被新尝试复用）一律不发布。
     """
-    meta = db.get_image(image_id)
-    job = db.latest_rotation()
-    if job and meta and meta["master_key_id"] == job["old_key_id"]:
-        try:
-            res = await keys.rewrap(meta["master_key_id"], meta["wrapped_dek"],
-                                    f"finalize:{image_id}")
-        except KeyServiceError as exc:
-            if exc.status_code == 410:
-                # 旧 MK 已销毁且该行信封未能提前迁移：绝不能晚发布不可读原片
+    for _ in range(5):
+        meta = db.get_image(image_id)
+        if meta is None or meta["status"] != "receiving" \
+                or meta["blob_path"] != blob_path:
+            # 本次尝试已被判失败或被新尝试替换：不发布
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "upload_no_longer_active",
+                        "message": "upload was retired before it could be "
+                                   "finalized (timed out or interrupted)"})
+        if db.key_is_retiring(meta["master_key_id"]):
+            try:
+                current = await keys.current_master()
+            except KeyServiceError as exc:
+                raise _key_error(exc)
+            if not current or current == meta["master_key_id"]:
+                # 没有更新的可用密钥（理论窗口）：按不可发布处理
                 raise HTTPException(
                     status_code=409,
-                    detail={"code": "old_key_destroyed",
-                            "message": "upload cannot be finalized; its key was "
-                                       "rotated and destroyed before completion"})
-            raise
-        db.rewrap_row(image_id, meta["master_key_id"],
-                      res["key_id"], res["wrapped_dek"])
-    db.finalize_image(image_id, stats["plain_size"], stats["enc_size"],
-                      stats["sha256"])
-    return db.get_image(image_id)
+                    detail={"code": "no_active_master",
+                            "message": "no active master key available for "
+                                       "rebinding this upload"})
+            try:
+                res = await keys.rewrap(
+                    meta["master_key_id"], meta["wrapped_dek"],
+                    f"finalize:{image_id}:{blob_path}:{meta['master_key_id']}")
+            except KeyServiceError as exc:
+                if exc.status_code == 410:
+                    # 再读一次：迁移线程可能已把本行改绑到新 MK，此时 410
+                    # 只说明旧信封过时，上传仍可正常发布。
+                    latest = db.get_image(image_id)
+                    if latest and latest["status"] == "receiving" \
+                            and latest["blob_path"] == blob_path \
+                            and latest["master_key_id"] != meta["master_key_id"]:
+                        continue
+                    # 旧 MK 已销毁且该行信封未能迁移：绝不能晚发布不可读原片
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "old_key_destroyed",
+                                "message": "upload cannot be finalized; its key "
+                                           "was rotated and destroyed before "
+                                           "completion"})
+                raise
+            db.rewrap_row(image_id, meta["master_key_id"],
+                          res["key_id"], res["wrapped_dek"])
+            continue
+        if db.finalize_image(image_id, blob_path, stats["plain_size"],
+                             stats["enc_size"], stats["sha256"]):
+            return db.get_image(image_id)
+        # 发布被条件拒绝（期间轮换登记了该密钥/行被清退）：重新判断
+    raise HTTPException(
+        status_code=409,
+        detail={"code": "upload_no_longer_active",
+                "message": "upload could not be finalized consistently"})
 
 
 def _check_content_length(request: Request):
     cl = request.headers.get("content-length")
     if cl is not None and int(cl) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, detail="upload exceeds MAX_UPLOAD_BYTES")
+
+
+async def _begin_attempt(image_id: str, filename: str | None,
+                         content_type: str | None,
+                         idem_token: str | None) -> dict | None:
+    """生成 DEK 并登记本次上传尝试；返回尝试上下文（含 DEK 响应、明文 DEK、
+    blob 路径、被替换的旧残片路径）。
+
+    抛出 ImageAlreadyExists / IdempotentReplay 由调用方翻译为 HTTP 响应。
+    若 generate_dek 返回的主密钥恰已被某轮换作业登记为旧密钥（极小窗口），
+    改用切换后的新 MK 重新生成 DEK 再登记，绝不把新行挂到即将销毁的密钥。
+    每次尝试使用独立 blob 路径，使迟到的旧尝试无法发布/误删新尝试的数据。
+    """
+    for _ in range(3):
+        try:
+            dek_resp = await keys.generate_dek()
+        except KeyServiceError as exc:
+            raise _key_error(exc)
+        dek = bytes.fromhex(dek_resp["dek"])
+        blob_path = os.path.join(BLOB_DIR,
+                                 f"{image_id}.{uuid.uuid4().hex}.msef")
+        # 先登记为活跃再写库：轮换扫描与本次登记之间不再有"已建行但未登记
+        # 活跃"的窗口，避免刚建立的上传被误当僵尸清退。
+        inflight.add(image_id, blob_path)
+        try:
+            _, replaced = db.create_image(
+                image_id, filename, content_type, dek_resp["key_id"],
+                dek_resp["wrapped_dek"], blob_path, idem_token)
+        except RetiringKey:
+            del dek  # 该 MK 正在被清退：换新 MK 重新生成
+            inflight.remove(image_id, blob_path)
+            continue
+        except Exception:
+            inflight.remove(image_id, blob_path)
+            raise
+        return {"dek_resp": dek_resp, "dek": dek, "blob_path": blob_path,
+                "replaced": replaced}
+    raise HTTPException(
+        status_code=503,
+        detail={"code": "rotation_in_progress",
+                "message": "master key rotation is in progress; retry upload"})
+
+
+def _begin_error(exc: Exception, response: Response) -> dict:
+    """把登记阶段的两类冲突翻译为与既有幂等语义一致的响应。"""
+    if isinstance(exc, IdempotentReplay):
+        existing = db.get_image(exc.image_id)
+        response.status_code = 200
+        return _replay_receipt(existing, response)
+    raise HTTPException(
+        status_code=409,
+        detail={"code": "image_exists",
+                "message": f"image already exists ({exc.status})"})
+
+
+async def _run_upload(request: Request, response: Response, image_id: str,
+                      attempt: dict) -> dict:
+    """流式加密写盘 -> 绑定可用密钥 -> 条件发布 -> 回执。
+
+    任一步失败都只清理"本次尝试"的密文残片；若该行已被新尝试复用或被
+    轮换清退，条件更新不会误伤它。已判失败/已清退的上传即使随后传完也
+    不会被发布（见 _finalize_with_rebind）。
+    """
+    dek, blob_path = attempt["dek"], attempt["blob_path"]
+    # _begin_attempt 已把本次尝试登记为活跃；此处只负责在结束时注销。
+    try:
+        replaced = attempt["replaced"]
+        if replaced and replaced != blob_path:
+            _remove_blob(replaced)  # 被复用的旧失败尝试的残片
+        stats = await _stream_to_blob(request, blob_path, dek)
+        if stats["plain_size"] > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, detail="upload exceeds MAX_UPLOAD_BYTES")
+        final = await _finalize_with_rebind(image_id, blob_path, stats)
+    except HTTPException:
+        db.fail_image(image_id, blob_path, "upload rejected")
+        # blob_path 是本次尝试独占的路径，任何失败都可安全清理；
+        # fail_image 的条件更新保证不会改动已发布/已被新尝试复用的行。
+        _remove_blob(blob_path)
+        raise
+    except Exception as exc:  # 写入失败/发布被拒：判失败并清理密文残片
+        db.fail_image(image_id, blob_path, f"upload failed: {exc!r}")
+        _remove_blob(blob_path)
+        raise HTTPException(status_code=502,
+                            detail=f"upload failed: {exc!r}") from exc
+    finally:
+        inflight.remove(image_id, blob_path)
+    return {"image_id": image_id, "status": "ready",
+            "size": stats["plain_size"], "sha256": stats["sha256"],
+            "master_key_id": final["master_key_id"]}
+
+
+def _replay_receipt(existing: dict, response: Response) -> dict:
+    response.status_code = 200
+    return {"image_id": existing["image_id"], "status": existing["status"],
+            "idempotent": True}
 
 
 @app.post("/images", status_code=201,
@@ -163,47 +320,19 @@ async def upload_image(request: Request, response: Response,
     if x_idempotency_token:
         existing = db.get_by_token(x_idempotency_token)
         if existing:
-            response.status_code = 200
-            return {"image_id": existing["image_id"], "status": existing["status"],
-                    "idempotent": True}
-    try:
-        dek_resp = await keys.generate_dek()
-    except KeyServiceError as exc:
-        raise _key_error(exc)
-    master_key_id = dek_resp["key_id"]
-    wrapped_dek = dek_resp["wrapped_dek"]
-    dek = bytes.fromhex(dek_resp["dek"])  # 仅存于本请求内存
-
+            return _replay_receipt(existing, response)
     image_id = "img-" + uuid.uuid4().hex
-    blob_path = os.path.join(BLOB_DIR, image_id + ".msef")
-    db.create_image(image_id, x_filename,
-                    x_content_type or request.headers.get("content-type"),
-                    master_key_id, wrapped_dek, blob_path, x_idempotency_token)
     try:
-        stats = await _stream_to_blob(request, blob_path, dek)
-        if stats["plain_size"] > MAX_UPLOAD_BYTES:
-            raise HTTPException(413, detail="upload exceeds MAX_UPLOAD_BYTES")
-        final = await _finalize_with_rebind(image_id, stats)
-    except HTTPException:
-        db.fail_image(image_id, "upload rejected")
-        try:
-            os.remove(blob_path)
-        except OSError:
-            pass
-        raise
-    except Exception as exc:  # 写入失败：判失败并清理密文残片
-        db.fail_image(image_id, f"upload failed: {exc!r}")
-        try:
-            os.remove(blob_path)
-        except OSError:
-            pass
-        raise HTTPException(status_code=502,
-                            detail=f"upload failed: {exc!r}") from exc
+        attempt = await _begin_attempt(
+            image_id, x_filename,
+            x_content_type or request.headers.get("content-type"),
+            x_idempotency_token)
+    except (ImageAlreadyExists, IdempotentReplay) as exc:
+        return _begin_error(exc, response)
+    try:
+        return await _run_upload(request, response, image_id, attempt)
     finally:
-        del dek  # 尽快丢弃明文 DEK 引用
-    return {"image_id": image_id, "status": "ready",
-            "size": stats["plain_size"], "sha256": stats["sha256"],
-            "master_key_id": final["master_key_id"]}
+        del attempt  # 尽快丢弃明文 DEK 引用
 
 
 @app.put("/images/{image_id}", status_code=201,
@@ -218,45 +347,18 @@ async def upload_image_named(image_id: str, request: Request, response: Response
     if x_idempotency_token:
         existing = db.get_by_token(x_idempotency_token)
         if existing:
-            response.status_code = 200
-            return {"image_id": existing["image_id"], "status": existing["status"],
-                    "idempotent": True}
-    current = db.get_image(image_id)
-    if current and current["status"] in ("receiving", "ready"):
-        raise HTTPException(409, detail=f"image_id already exists ({current['status']})")
+            return _replay_receipt(existing, response)
     try:
-        dek_resp = await keys.generate_dek()
-    except KeyServiceError as exc:
-        raise _key_error(exc)
-    blob_path = os.path.join(BLOB_DIR, image_id + ".msef")
-    db.create_image(image_id, x_filename,
-                    x_content_type or request.headers.get("content-type"),
-                    dek_resp["key_id"], dek_resp["wrapped_dek"],
-                    blob_path, x_idempotency_token)
-    dek = bytes.fromhex(dek_resp["dek"])
+        attempt = await _begin_attempt(
+            image_id, x_filename,
+            x_content_type or request.headers.get("content-type"),
+            x_idempotency_token)
+    except (ImageAlreadyExists, IdempotentReplay) as exc:
+        return _begin_error(exc, response)
     try:
-        stats = await _stream_to_blob(request, blob_path, dek)
-        final = await _finalize_with_rebind(image_id, stats)
-    except HTTPException:
-        db.fail_image(image_id, "upload rejected")
-        try:
-            os.remove(blob_path)
-        except OSError:
-            pass
-        raise
-    except Exception as exc:
-        db.fail_image(image_id, f"upload failed: {exc!r}")
-        try:
-            os.remove(blob_path)
-        except OSError:
-            pass
-        raise HTTPException(status_code=502,
-                            detail=f"upload failed: {exc!r}") from exc
+        return await _run_upload(request, response, image_id, attempt)
     finally:
-        del dek
-    return {"image_id": image_id, "status": "ready",
-            "size": stats["plain_size"], "sha256": stats["sha256"],
-            "master_key_id": final["master_key_id"]}
+        del attempt
 
 
 # --------------------------------------------------------------------------
@@ -350,7 +452,18 @@ async def create_rotation(_: RotationRequest):
         old_key, new_key = rot["old_key_id"], rot["new_key_id"]
         total = (db.count_under_key(old_key, only_migratable=True)
                  if old_key else 0)
-        job_id = db.create_rotation(old_key, new_key, total)
+        try:
+            job_id = db.create_rotation(old_key, new_key, total)
+        except RuntimeError:
+            # 并发窗口：另一请求已先建单并完成了 MK 切换。以既有作业为准，
+            # 不启动第二个轮换。
+            active = db.active_rotation()
+            if active is None:
+                raise
+            raise HTTPException(
+                409, detail={"code": "rotation_in_progress",
+                             "job_id": active["job_id"],
+                             "state": active["state"]})
     except KeyServiceError as exc:
         raise _key_error(exc)
     return {"job_id": job_id, "state": "migrating", "old_key_id": old_key,

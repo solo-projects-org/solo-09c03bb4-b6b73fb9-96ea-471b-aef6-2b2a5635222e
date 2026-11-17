@@ -22,23 +22,38 @@ import threading
 import time
 import traceback
 
+from .inflight import InflightUploads
 from .keyclient import KeyClient, KeyServiceError
 from .metadata import MetadataDB
 
 POLL_INTERVAL = 1.0
 BATCH_PAUSE = 0.02           # 批次间让出，避免挤占在线流量
 RETRY_BUDGET = 6             # 单作业内瞬时错误总重试预算
-# 超过此时长仍处于 receiving 的上传视为僵死（崩溃残留由启动恢复处理，
-# 这里兜底处理连接挂起），判失败以解除对轮换销毁阶段的阻塞。
+# 超过此时长且本进程已无对应请求的 receiving 行视为僵死（崩溃遗留由启动
+# 恢复处理，这里兜底处理连接挂起），判失败并清理密文残片以解除销毁阻塞。
+# 本进程仍在服务、只是传得慢的上传不受此阈值影响：迁移会把它的信封改绑
+# 当前 MK，既不阻塞旧密钥销毁，也能在传完后正常发布。
 UPLOAD_STALE_SECONDS = float(os.environ.get("UPLOAD_STALE_SECONDS", "3600"))
+
+
+def _remove_blob(path: str | None) -> bool:
+    if not path:
+        return False
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
 
 
 class RotationWorker:
     def __init__(self, db: MetadataDB, keys: KeyClient,
-                 loop: asyncio.AbstractEventLoop):
+                 loop: asyncio.AbstractEventLoop,
+                 inflight: InflightUploads | None = None):
         self._db = db
         self._keys = keys
         self._loop = loop
+        self._inflight = inflight or InflightUploads()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -106,17 +121,40 @@ class RotationWorker:
             latest = self._db.get_rotation(job_id)
             if latest is None or latest["state"] == "failed":
                 return False
-            # 在途上传分两种：
-            #  1) 僵死（超时）-> 判失败，禁止晚发布，解除销毁阻塞
-            #  2) 活跃 -> 跳过，本轮先迁移别的；下轮再看（最终成功的上传会在
-            #     finalize 时改绑当前新 MK；失败的不会成为可读原片）
             if row["status"] == "receiving":
-                if time.time() - row["created_at"] > UPLOAD_STALE_SECONDS:
-                    self._db.fail_image(
-                        row["image_id"],
-                        "stale receiving upload during key rotation")
-                    self._db.bump_rotation(job_id, migrated=1)
+                # 在途上传一律先改绑当前新 MK，使其不再占用旧密钥：
+                #  * 仍活跃（哪怕很慢、已超过阈值）：上传端持有的明文 DEK
+                #    不变，rewrap 不暴露 DEK；它传完后看到的是可用新密钥，
+                #    正常发布。旧 MK 因此不被慢上传长期阻塞销毁。
+                #  * 本进程已无对应请求且超过阈值：判失败、清理残片。
+                if not self._inflight.is_active(row["image_id"], row["blob_path"]) \
+                        and time.time() - row["created_at"] > UPLOAD_STALE_SECONDS:
+                    if self._db.retire_stale_receiving(
+                            row["image_id"], row["blob_path"],
+                            "stale receiving upload during key rotation"):
+                        _remove_blob(row["blob_path"])
+                        self._db.bump_rotation(job_id, migrated=1)
+                        migrated_now += 1
+                    continue
+                try:
+                    token = f"{job_id}:{row['image_id']}:{row['blob_path']}"
+                    res = await self._keys.rewrap(
+                        old_key, row["wrapped_dek"], token)
+                except KeyServiceError as exc:
+                    if exc.status_code == 410:
+                        # 旧 MK 已在极端窗口被销毁：该上传无法完成，
+                        # 判失败并清理残片（迟到的完成也不会发布）
+                        if self._db.retire_stale_receiving(
+                                row["image_id"], row["blob_path"],
+                                "its master key was destroyed during rotation"):
+                            _remove_blob(row["blob_path"])
+                            self._db.bump_rotation(job_id, failed=1)
+                        continue
+                    raise
+                if self._db.rewrap_row(row["image_id"], old_key,
+                                       res["key_id"], res["wrapped_dek"]):
                     migrated_now += 1
+                    self._db.bump_rotation(job_id, migrated=1)
                 continue
             try:
                 token = f"{job_id}:{row['image_id']}"
